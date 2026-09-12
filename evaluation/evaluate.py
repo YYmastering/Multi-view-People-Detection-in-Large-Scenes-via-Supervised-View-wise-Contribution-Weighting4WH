@@ -19,6 +19,9 @@ import numpy as np
 
 
 def evaluate(res_fpath, gt_fpath, dist_thres, dataset='wildtrack'):
+    if str(dataset).lower() == 'warehouse':
+        from evaluation.pyeval.evaluateDetection import evaluateDetection_py
+        return evaluateDetection_py(res_fpath, gt_fpath, dist_thres, dataset)
     try:
         import matlab.engine
 
@@ -26,7 +29,7 @@ def evaluate(res_fpath, gt_fpath, dist_thres, dataset='wildtrack'):
         eng.cd('evaluation/motchallenge-devkit')
         res = eng.evaluateDetection(res_fpath, gt_fpath, dataset)
         recall, precision, moda, modp = np.array(res['detMets']).squeeze()[[0, 1, -2, -1]]
-    except:
+    except (ImportError, ModuleNotFoundError, RuntimeError):
         from evaluation.pyeval.evaluateDetection import evaluateDetection_py
 
         recall, precision, moda, modp = evaluateDetection_py(res_fpath, gt_fpath, dist_thres, dataset)

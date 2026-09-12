@@ -1,116 +1,210 @@
-import time
-import torch
 import os
+import time
+
 import numpy as np
+import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import cv2
-from PIL import Image
+
 from evaluation.evaluate import evaluate
 from utils.nms import nms
-from utils.meters import AverageMeter
-from utils.image_utils import add_heatmap_to_image, vertical_prediction_vis
-from utils.gaussian_mse import target_transform
-from utils.person_help import vis
-
-
-class BaseTrainer(object):
-    def __init__(self):
-        super(BaseTrainer, self).__init__()
 
 
 class PerspectiveTrainer:
-    def __init__(self, model, args, logdir, denormalize, **kwargs):
+    def __init__(self, model, args, logdir, denormalize=None):
         self.model = model
         self.args = args
-
-        self.weight_2D = args.weight_2D
-        self.weight_svp = args.weight_svp
-
-        self.fix_2D = args.fix_2D
-        self.fix_svp = args.fix_svp
-        self.fix_weight = args.fix_weight
-
-        self.cls_thres = args.cls_thres
-        self.nms_thres = args.nms_thres
-        self.dist_thres = args.dist_thres
         self.logdir = logdir
-        self.denormalize = denormalize
         self.num_cam = model.num_cam
+        self.best_moda = float("-inf")
 
-    def test(self, data_loader, res_fpath):
-        print('Testing...')
+    @staticmethod
+    def _flat_image_targets(image_targets):
+        # [B, N, 1, H, W] -> sample-major [B*N, 1, H, W]
+        return image_targets.flatten(0, 1)
+
+    def _losses(self, outputs, ground_target, image_targets):
+        image_result = outputs[0] if isinstance(outputs, tuple) else outputs
+        image_target = self._flat_image_targets(image_targets).to(
+            image_result.device, non_blocking=True
+        )
+        image_loss = F.mse_loss(image_result, image_target) / self.num_cam
+        zero = image_loss.detach().new_zeros(())
+
+        if self.args.variant == "2D":
+            return image_loss, image_loss, zero, zero
+
+        view_result, view_mask = outputs[1], outputs[-1]
+        batch_size = ground_target.shape[0]
+        ground_target = ground_target.to(view_result.device, non_blocking=True)
+        view_target = ground_target.unsqueeze(1).expand(
+            -1, self.num_cam, -1, -1, -1
+        ).reshape_as(view_result)
+        # Each SVP branch predicts its masked contribution to the global map.
+        view_target = view_target * view_mask / self.num_cam
+        view_loss = F.mse_loss(view_result, view_target)
+
+        if self.args.variant == "2D_SVP":
+            total = (
+                self.args.weight_2D * image_loss.to(view_loss.device)
+                + self.args.weight_svp * view_loss
+            )
+            return total, image_loss, view_loss, zero
+
+        ground_result = outputs[2]
+        fusion_loss = F.mse_loss(
+            ground_result,
+            ground_target.to(ground_result.device, non_blocking=True),
+        )
+        total = (
+            fusion_loss
+            + self.args.weight_2D * image_loss.to(fusion_loss.device)
+            + self.args.weight_svp * view_loss.to(fusion_loss.device)
+        )
+        return total, image_loss, view_loss, fusion_loss
+
+    def train(self, data_loader, epoch, optimizer, scheduler):
+        self.model.train()
+        sums = np.zeros(4, dtype=np.float64)
+        start = time.time()
+
+        for batch_index, (images, ground_target, image_targets, _) in enumerate(
+            data_loader
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            outputs = self.model(images)
+            loss_values = self._losses(outputs, ground_target, image_targets)
+            loss_values[0].backward()
+            optimizer.step()
+            if isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                scheduler.step()
+
+            sums += np.asarray([value.item() for value in loss_values])
+            if (
+                batch_index == 0
+                or (batch_index + 1) % self.args.log_interval == 0
+                or batch_index + 1 == len(data_loader)
+            ):
+                averages = sums / (batch_index + 1)
+                print(
+                    f"Train epoch {epoch}, batch {batch_index + 1}/{len(data_loader)}, "
+                    f"loss {averages[0]:.6f} "
+                    f"(2D {averages[1]:.6f}, SVP {averages[2]:.6f}, "
+                    f"fusion {averages[3]:.6f}), "
+                    f"lr {optimizer.param_groups[0]['lr']:.8f}, "
+                    f"time {time.time() - start:.1f}s"
+                )
+
+        if not isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            scheduler.step()
+        return sums / max(len(data_loader), 1)
+
+    def validate(self, data_loader, result_path=None, epoch=None):
         self.model.eval()
-        losses = 0
-        all_res_list = []
-        t0 = time.time()
+        sums = np.zeros(4, dtype=np.float64)
+        candidates = []
+        start = time.time()
 
-        for batch_idx, (imgs, gp_gt, imgs_gt, frame) in enumerate(data_loader):
-            with torch.no_grad():
-                img_res, view_gp_res, gp_res, mask = self.model(imgs)
-            if res_fpath is not None:
-                map_grid_res = gp_res.detach().cpu().squeeze()
-                map_grid_res = torch.relu(map_grid_res)
-                map_grid_res = (map_grid_res - map_grid_res.min()) / (map_grid_res.max() - map_grid_res.min() + 1e-12)
-                v_s = map_grid_res[map_grid_res > self.cls_thres].unsqueeze(1)
-                grid_ij = (map_grid_res > self.cls_thres).nonzero()
-                if data_loader.dataset.base.indexing == 'xy':
-                    grid_xy = grid_ij[:, [1, 0]]
-                else:
-                    grid_xy = grid_ij
-                all_res_list.append(torch.cat([torch.ones_like(v_s) * frame, grid_xy.float() *
-                                               data_loader.dataset.grid_reduce, v_s], dim=1))
+        with torch.no_grad():
+            for batch_index, (
+                images, ground_target, image_targets, frames
+            ) in enumerate(data_loader):
+                outputs = self.model(images)
+                loss_values = self._losses(
+                    outputs, ground_target, image_targets
+                )
+                sums += np.asarray([value.item() for value in loss_values])
 
-            # img_2D loss
-            loss_2D = F.mse_loss(img_res, imgs_gt[0].to(img_res.device)) / data_loader.dataset.num_cam
-            # SVP loss
-            view_gp_gt = gp_gt.to(mask.device) * mask / data_loader.dataset.num_cam
-            loss_svp = F.mse_loss(view_gp_res, view_gp_gt)
-            # loss fusion
-            loss_fusion = F.mse_loss(gp_res, gp_gt.to(gp_res.device))
+                if self.args.variant != "2D_SVP_VCW" or result_path is None:
+                    continue
+                ground_results = outputs[2].detach().cpu()
+                for sample_index, frame in enumerate(frames.tolist()):
+                    score_map = torch.relu(ground_results[sample_index, 0])
+                    score_min, score_max = score_map.min(), score_map.max()
+                    if (score_max - score_min).item() <= 1e-12:
+                        continue
+                    score_map = (score_map - score_min) / (score_max - score_min)
+                    selected = score_map > self.args.cls_thres
+                    positions = selected.nonzero(as_tuple=False)
+                    if positions.numel() == 0:
+                        continue
+                    if data_loader.dataset.base.indexing == "xy":
+                        positions = positions[:, [1, 0]]
+                    scores = score_map[selected, None]
+                    frame_column = torch.full_like(scores, float(frame))
+                    candidates.append(torch.cat([
+                        frame_column,
+                        positions.float() * data_loader.dataset.grid_reduce,
+                        scores,
+                    ], dim=1))
 
-            loss = loss_fusion + self.weight_svp * loss_svp + self.weight_2D * loss_2D
-            losses += loss.item()
-
-            val_interval = len(data_loader) // 4
-            if (batch_idx + 1) % val_interval == 0:
-                # visulaization in training process
-                # 2D image
-                heatmap0_head = img_res[0].detach().cpu().numpy().squeeze()
-                img0 = self.denormalize(imgs[0, 0]).cpu().numpy().squeeze().transpose([1, 2, 0])
-                img0 = Image.fromarray((img0 * 255).astype('uint8'))
-                head_cam_result = add_heatmap_to_image(heatmap0_head, img0)
-                head_cam_result.save(os.path.join(self.logdir, f'b_{batch_idx + 1}_cam1_head.jpg'))
-                # single-view prediction
-                vertical_prediction_vis(view_gp_res[0], view_gp_gt[0],
-                               save_dir=os.path.join(self.logdir, f'b_{batch_idx + 1}_cam1_gp_res.jpg'))
-                # ground plane fusion prediction
-                vertical_prediction_vis(gp_res, gp_gt, save_dir=os.path.join(self.logdir, f'b_{batch_idx + 1}_gp_res.jpg'))
-
-        t1 = time.time()
-        t_epoch = t1 - t0
+        averages = sums / max(len(data_loader), 1)
         print(
-            f'################################### Testing #############################################\n'
-            f'Batch:{len(data_loader)}, Loss:{losses / len(data_loader):.6f} [2D {loss_2D.item():.6f},'
-            f' SVP {loss_svp.item():.6f}, fusion {loss_fusion.item():.6f},], Time:{t_epoch:.1f} '
-            f' maxima:{gp_res.max():.3f}')
-        moda = 0
-        if res_fpath is not None:
-            all_res_list = torch.cat(all_res_list, dim=0)
-            np.savetxt(os.path.abspath(os.path.dirname(res_fpath)) + '/all_res.txt', all_res_list.numpy(), '%.8f')
-            res_list = []
-            for frame in np.unique(all_res_list[:, 0]):
-                res = all_res_list[all_res_list[:, 0] == frame, :]
-                positions, scores = res[:, 1:3], res[:, 3]
-                ids, count = nms(positions, scores, 20, np.inf)
-                res_list.append(torch.cat([torch.ones([count, 1]) * frame, positions[ids[:count], :]], dim=1))
-            res_list = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
-            np.savetxt(res_fpath, res_list, '%d')
+            f"Validation epoch {epoch}, loss {averages[0]:.6f} "
+            f"(2D {averages[1]:.6f}, SVP {averages[2]:.6f}, "
+            f"fusion {averages[3]:.6f}), time {time.time() - start:.1f}s"
+        )
+        if self.args.variant != "2D_SVP_VCW" or result_path is None:
+            return {"loss": float(averages[0])}
 
-            recall, precision, moda, modp = evaluate(os.path.abspath(res_fpath), data_loader.dataset.gt_fpath,
-                                                     20, data_loader.dataset.base.__name__)
-            F1_score = 2 * precision * recall / (precision + recall + 1e-12)
-            print(f'moda: {moda:.1f}%, modp: {modp:.1f}%,'
-                  f' precision: {precision:.1f}%, recall: {recall:.1f}%, F1_score:{F1_score:.1f}%')
+        all_candidates = (
+            torch.cat(candidates, dim=0)
+            if candidates else torch.empty((0, 4), dtype=torch.float32)
+        )
+        candidate_path = os.path.join(
+            os.path.dirname(result_path), "all_res.txt"
+        )
+        np.savetxt(candidate_path, all_candidates.numpy(), fmt="%.8f")
 
-  
+        detections = []
+        if all_candidates.numel():
+            for frame in torch.unique(all_candidates[:, 0]):
+                frame_candidates = all_candidates[
+                    all_candidates[:, 0] == frame
+                ]
+                positions = frame_candidates[:, 1:3]
+                scores = frame_candidates[:, 3]
+                keep, count = nms(
+                    positions, scores, self.args.nms_thres,
+                    top_k=len(scores)
+                )
+                detections.append(torch.cat([
+                    torch.full((count, 1), frame.item()),
+                    positions[keep[:count]],
+                ], dim=1))
+        detections = (
+            torch.cat(detections, dim=0).numpy()
+            if detections else np.empty((0, 3), dtype=np.float32)
+        )
+        np.savetxt(result_path, detections, fmt="%d")
+
+        recall, precision, moda, modp = evaluate(
+            os.path.abspath(result_path),
+            data_loader.dataset.gt_fpath,
+            self.args.dist_thres,
+            data_loader.dataset.base.__name__,
+        )
+        f1_score = 2 * precision * recall / (precision + recall + 1e-12)
+        metrics = {
+            "loss": float(averages[0]),
+            "moda": float(moda),
+            "modp": float(modp),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1_score),
+        }
+        print(
+            f"MODA {moda:.1f}%, MODP {modp:.1f}%, precision {precision:.1f}%, "
+            f"recall {recall:.1f}%, F1 {f1_score:.1f}%"
+        )
+        return metrics
+
+    def save_checkpoint(self, path, epoch, optimizer, scheduler, metrics=None):
+        checkpoint = {
+            "epoch": epoch,
+            "variant": self.args.variant,
+            "model": self.model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "metrics": metrics or {},
+        }
+        torch.save(checkpoint, path)

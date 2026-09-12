@@ -14,7 +14,7 @@ class Logger(object):
         self.close()
 
     def __enter__(self):
-        pass
+        return self
 
     def __exit__(self, *args):
         self.close()
@@ -31,6 +31,6 @@ class Logger(object):
             os.fsync(self.file.fileno())
 
     def close(self):
-        self.console.close()
         if self.file is not None:
             self.file.close()
+            self.file = None
